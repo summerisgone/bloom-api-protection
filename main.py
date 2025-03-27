@@ -44,9 +44,8 @@ async def session_middleware(request: Request, call_next):
             key="session_id",
             value=session_id,
             httponly=True,
-            secure=True,
             samesite="lax",
-            max_age=30 * 24 * 60 * 60  # 30 дней
+            path="/"
         )
     
     # Добавляем URL в фильтр сессии
