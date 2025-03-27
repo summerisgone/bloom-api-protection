@@ -1,11 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import os
-from typing import List, Dict
+from typing import List, Dict, Callable
 import re
+import uuid
+from datetime import datetime, timedelta
+from functools import wraps
+from bloom_filter import session_filters
 
 app = FastAPI(
     title="Bloom Server",
@@ -16,7 +20,7 @@ app = FastAPI(
 # Настройка CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене замените на конкретные домены
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,6 +28,31 @@ app.add_middleware(
 
 # Монтируем статические файлы
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Middleware для установки cookie сессии
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    response = await call_next(request)
+    
+    # Проверяем наличие cookie сессии
+    session_id = request.cookies.get("session_id")
+    
+    if not session_id:
+        # Создаем новую сессию
+        session_id = str(uuid.uuid4())
+        response.set_cookie(
+            key="session_id",
+            value=session_id,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=30 * 24 * 60 * 60  # 30 дней
+        )
+    
+    # Добавляем URL в фильтр сессии
+    session_filters.add_url(session_id, request.url.path)
+    
+    return response
 
 class SearchQuery(BaseModel):
     query: str
@@ -84,12 +113,28 @@ def get_suggestions(filepath: str, query: str) -> List[SuggestionResult]:
         print(f"Error reading file {filepath}: {str(e)}")
     return suggestions
 
+def require_web_session(func: Callable):
+    @wraps(func)
+    async def wrapper(*args, request: Request, **kwargs):
+        session_id = request.cookies.get("session_id")
+        
+        # Проверяем, был ли запрос к главной странице
+        if not session_filters.check_url(session_id, "/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Это API доступно только через веб-интерфейс. Пожалуйста, сначала посетите главную страницу."
+            )
+        
+        return await func(*args, request=request, **kwargs)
+    return wrapper
+
 @app.get("/")
 async def root():
     return FileResponse("static/index.html")
 
 @app.post("/api/search")
-async def search(query: SearchQuery):
+@require_web_session
+async def search(query: SearchQuery, request: Request):
     if not query.query.strip():
         raise HTTPException(status_code=400, detail="Поисковый запрос не может быть пустым")
     
@@ -109,7 +154,8 @@ async def search(query: SearchQuery):
     return results
 
 @app.post("/api/suggestions")
-async def get_search_suggestions(query: SearchQuery):
+@require_web_session
+async def get_search_suggestions(query: SearchQuery, request: Request):
     if not query.query.strip():
         return []
     
